@@ -1,27 +1,11 @@
-"""kiro-signal: talk to a Kiro chat from your phone, over Signal.
+"""Relays your Signal messages into a Kiro chat, and gives the chat a signal_reply tool.
 
-    signal-cli daemon --http   (one process; it alone holds the bot's Signal account)
-      |-- GET  /api/v1/events --> relay --> your Kiro chat (kiro) or KiroCrew's webhook (crew)
-      '-- POST /api/v1/rpc    <-- mcp: signal_reply(text), recipient fixed to the owner
-
-Modes (standard library only, Python 3.9+):
-    python kiro_signal.py mcp          stdio MCP server with one tool, signal_reply; Kiro starts it
-    python kiro_signal.py kiro         relay the owner's messages into one Kiro IDE chat, through
-                                       the bridge extension (bridge/)
-    python kiro_signal.py crew         relay them to KiroCrew's inbound webhook instead
-    python kiro_signal.py wait [secs]  print the owner's next message(s) and exit, for an agent
-                                       that polls. Run only one of kiro, crew and wait at a time:
-                                       each consumes what it reads.
-
-State lives in ~/.kiro-signal (or $KIRO_SIGNAL_HOME): config.json, the bridge token, the queue
-and the stream position. `owner` in config.json is both the ONLY sender the relays accept and
-the ONLY recipient signal_reply can reach. install.py sets everything up; see INSTALL.md.
+    python kiro_signal.py relay   the owner's messages go into the Kiro chat in config.json
+    python kiro_signal.py mcp     stdio MCP server with one tool, signal_reply
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import http.client
 import json
 import os
@@ -37,39 +21,24 @@ from pathlib import Path
 VERSION = "1.0.0"
 HOME = Path(os.environ.get("KIRO_SIGNAL_HOME") or Path.home() / ".kiro-signal")
 CONFIG_FILE = HOME / "config.json"
-STATE_FILE = HOME / "last_event_id.txt"  # resume point, so a relay restart neither replays nor drops
-PENDING_FILE = HOME / "pending.json"  # owner messages the Kiro chat hasn't taken yet
-TOKEN_FILE = HOME / "bridge_token.txt"  # written by the bridge extension on its first start
-CHUNK = 2000  # official clients turn longer bodies into a text attachment; stay under it
-RETRY_DELAYS = (0, 5, 10, 20, 40) + (60,) * 9  # ~10 min of waiting out busy/capacity answers
+STREAM_POSITION_FILE = HOME / "last_event_id.txt"
+QUEUE_FILE = HOME / "pending.json"
+BRIDGE_TOKEN_FILE = HOME / "bridge_token.txt"
+DEFAULTS = {"signal_rpc": "http://127.0.0.1:39275", "kiro_bridge": "http://127.0.0.1:39276"}
 
-DEFAULTS = {
-    "signal_rpc": "http://127.0.0.1:39275",  # off the common dev ports; the bridge is 39276
-    "hook_url": "http://127.0.0.1:5476/api/hooks/agent",
-    "kiro_bridge": "http://127.0.0.1:39276",
-}
-
-FRAME_CREW = (
-    "[Signal message from the owner, relayed by kiro-signal]\n"
-    "{text}\n\n"
-    "[Relay note] Answer by calling the signal_reply tool; nothing else reaches the owner. "
-    "Signal shows plain text, so skip markdown. Before you finish, call register_hook with "
-    'hook_id "signal" and a summary of this conversation so far (under 4000 characters), '
-    "so the next Signal message has context."
-)
-
-# Starts with "[" on purpose: a prompt starting with "/" runs a slash command and aborts a turn.
-FRAME_KIRO = (
+# Signal's apps turn a longer message into a text attachment.
+SIGNAL_MESSAGE_LIMIT = 2000
+# Signal hides a typing indicator about 15 s after the last one.
+TYPING_REFRESH_SECONDS = 10
+# "force" or "flush" alone, or followed by ":" or a new line. "Force push the branch" isn't one.
+FORCE = re.compile(r"(?i)^(force|flush)(?:\s*[:\n]|[.!]?\s*$)")
+# Starts with "[": Kiro runs a prompt that starts with "/" as a slash command.
+PROMPT = (
     "[Signal message from the owner, relayed by kiro-signal]\n"
     "{text}\n\n"
     "[Relay note] The owner may be away from their desk, so answer with the signal_reply tool, "
     "in plain text without markdown. What you only write in this chat they may not see."
 )
-# "force" or "flush" alone, or followed by ":" or a new line, stops the running turn and puts
-# everything queued in now. "Force push the branch" is an ordinary message.
-FORCE = re.compile(r"(?i)^(force|flush)(?:\s*[:\n]|[.!]?\s*$)")
-TYPING_EVERY = 10  # Signal hides a typing indicator about 15 s after the last one
-
 TOOL = {
     "name": "signal_reply",
     "description": (
@@ -85,21 +54,17 @@ TOOL = {
 
 
 def log(msg: str) -> None:
-    # stderr only: in mcp mode stdout carries the protocol.
-    print(f"[kiro-signal] {msg}", file=sys.stderr, flush=True)
+    print(f"[kiro-signal] {msg}", file=sys.stderr, flush=True)  # stdout carries the MCP protocol
 
 
-def load_config(require_owner: bool = True) -> dict:
-    cfg = dict(DEFAULTS)
+def load_config() -> dict:
     try:
-        cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+        cfg = {**DEFAULTS, **json.loads(CONFIG_FILE.read_text(encoding="utf-8"))}
     except FileNotFoundError:
-        if require_owner:
-            raise SystemExit(f"{CONFIG_FILE} is missing: run install.py (see INSTALL.md)")
+        raise SystemExit(f"{CONFIG_FILE} is missing: run install.py (see INSTALL.md)")
     cfg["owner"] = str(cfg.get("owner") or "").strip()
-    if require_owner and not cfg["owner"]:
-        # Fail closed: an empty owner would leave the relay with no sender to accept.
-        raise SystemExit(f"{CONFIG_FILE}: no 'owner' yet. Run: install.py owner --phrase <word>")
+    if not cfg["owner"]:
+        raise SystemExit(f"{CONFIG_FILE} has no owner yet: run install.py owner --phrase <word>")
     return cfg
 
 
@@ -107,11 +72,8 @@ def load_config(require_owner: bool = True) -> dict:
 
 
 def rpc(cfg: dict, method: str, params: dict):
-    """One JSON-RPC call to the signal-cli daemon."""
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
-    req = urllib.request.Request(
-        cfg["signal_rpc"] + "/api/v1/rpc", data=body, headers={"Content-Type": "application/json"}
-    )
+    req = urllib.request.Request(cfg["signal_rpc"] + "/api/v1/rpc", data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         reply = json.loads(resp.read() or b"{}")
     if reply.get("error"):
@@ -119,33 +81,117 @@ def rpc(cfg: dict, method: str, params: dict):
     return reply.get("result")
 
 
-def chunks(text: str, limit: int = CHUNK) -> list[str]:
-    """Split text into Signal-sized pieces, preferring paragraph, then line, then word breaks."""
+def rpc_or_log(cfg: dict, method: str, params: dict) -> None:
+    try:
+        rpc(cfg, method, params)
+    except Exception as exc:
+        log(f"{method} failed: {exc}")
+
+
+def split_message(text: str, limit: int = SIGNAL_MESSAGE_LIMIT) -> list[str]:
+    """Pieces of at most `limit` characters, cut at a paragraph, then a line, then a word."""
     out, text = [], text.strip()
     while len(text) > limit:
-        cut = next(
-            (i for sep in ("\n\n", "\n", " ") if (i := text.rfind(sep, 0, limit)) > limit // 2),
-            limit,
-        )
+        cut = next((i for sep in ("\n\n", "\n", " ") if (i := text.rfind(sep, 0, limit)) > limit // 2), limit)
         out.append(text[:cut].rstrip())
         text = text[cut:].lstrip()
     return out + [text] if text else out
 
 
 def send_to_owner(cfg: dict, text: str) -> int:
-    parts = chunks(text)
+    parts = split_message(text)
     for part in parts:
         rpc(cfg, "send", {"recipient": [cfg["owner"]], "message": part})
     return len(parts)
 
 
-# ── MCP server (stdio, newline-delimited JSON-RPC) ──
+def owners_text(envelope: dict, owner: str) -> str | None:
+    """The text of a direct message from `owner`. Groups are refused: a reply would reach everyone."""
+    senders = {str(envelope.get(k) or "").lower() for k in ("sourceUuid", "sourceNumber")}
+    msg = envelope.get("dataMessage") or {}
+    text = str(msg.get("message") or "").strip()
+    return text if owner.lower() in senders and not msg.get("groupInfo") and text else None
 
 
-def mcp_handle(cfg: dict, req: dict) -> dict | None:
-    """Answer one MCP request; None for notifications, which take no reply."""
+def envelope_of(event_data: str) -> dict:
+    payload = json.loads(event_data)
+    return payload.get("params", payload).get("envelope") or {}
+
+
+def parse_sse(lines):
+    """(id, data) for each server-sent event."""
+    event_id, data = None, []
+    for raw in lines:
+        line = raw.decode("utf-8").rstrip("\r\n")
+        if not line:
+            if data:
+                yield event_id, "\n".join(data)
+            event_id, data = None, []
+            continue
+        field, _, value = line.partition(":")
+        value = value[1:] if value.startswith(" ") else value
+        if field == "id":
+            event_id = value
+        elif field == "data":
+            data.append(value)
+
+
+def follow_events(cfg: dict, handle) -> None:
+    """Calls handle(event_data) forever, resuming after the last event handled."""
+    while True:
+        last = STREAM_POSITION_FILE.read_text().strip() if STREAM_POSITION_FILE.exists() else ""
+        headers = {"Accept": "text/event-stream", **({"Last-Event-ID": last} if last else {})}
+        try:
+            with urllib.request.urlopen(urllib.request.Request(cfg["signal_rpc"] + "/api/v1/events", headers=headers), timeout=300) as resp:
+                for event_id, data in parse_sse(resp):
+                    handle(data)
+                    if event_id:
+                        STREAM_POSITION_FILE.write_text(event_id)
+        except Exception as exc:
+            log(f"event stream lost ({exc}); reconnecting in 5 s")
+        time.sleep(5)
+
+
+def wait_for_event(cfg: dict, timeout: float, pick):
+    """The first non-None pick(envelope) from the event stream, or None after `timeout` seconds."""
+    url = urllib.parse.urlsplit(cfg["signal_rpc"])
+    conn = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=10)
+    deadline = time.monotonic() + timeout
+    try:
+        conn.request("GET", "/api/v1/events", headers={"Accept": "text/event-stream"})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            raise RuntimeError(f"signal-cli events: HTTP {resp.status}")
+
+        def lines():
+            while (left := deadline - time.monotonic()) > 0:
+                conn.sock.settimeout(left)
+                try:
+                    line = resp.readline()
+                except OSError:
+                    return
+                if not line:
+                    return
+                yield line
+
+        for _, data in parse_sse(lines()):
+            try:
+                hit = pick(envelope_of(data))
+            except ValueError:
+                continue
+            if hit is not None:
+                return hit
+    finally:
+        conn.close()
+    return None
+
+
+# ── mcp ──
+
+
+def mcp_reply(cfg: dict, req: dict) -> dict | None:
     method, rid = req.get("method"), req.get("id")
-    if rid is None:
+    if rid is None:  # a notification
         return None
     params = req.get("params") or {}
     if method == "initialize":
@@ -159,13 +205,12 @@ def mcp_handle(cfg: dict, req: dict) -> dict | None:
     elif method == "tools/list":
         result = {"tools": [TOOL]}
     elif method == "tools/call" and params.get("name") == TOOL["name"]:
-        # Only `text` is read: whatever else the caller passes, the recipient stays the owner.
+        # Only `text` is read, so no argument can change the recipient.
         text = str((params.get("arguments") or {}).get("text") or "").strip()
         try:
             if not text:
                 raise ValueError("text is empty")
-            sent = send_to_owner(cfg, text)
-            result = {"content": [{"type": "text", "text": f"Sent {sent} Signal message(s) to the owner."}]}
+            result = {"content": [{"type": "text", "text": f"Sent {send_to_owner(cfg, text)} Signal message(s) to the owner."}]}
         except Exception as exc:
             result = {"content": [{"type": "text", "text": f"Signal send failed: {exc}"}], "isError": True}
     else:
@@ -174,12 +219,11 @@ def mcp_handle(cfg: dict, req: dict) -> dict | None:
 
 
 def serve_mcp(cfg: dict) -> None:
-    # Binary streams: Windows text mode would re-encode and turn \n into \r\n.
-    for line in sys.stdin.buffer:
+    for line in sys.stdin.buffer:  # bytes, so Windows doesn't turn \n into \r\n
         if not line.strip():
             continue
         try:
-            reply = mcp_handle(cfg, json.loads(line))
+            reply = mcp_reply(cfg, json.loads(line))
         except json.JSONDecodeError:
             reply = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
         if reply is not None:
@@ -187,179 +231,46 @@ def serve_mcp(cfg: dict) -> None:
             sys.stdout.buffer.flush()
 
 
-# ── the event stream ──
-
-
-def inbound_text(envelope: dict, owner: str) -> str | None:
-    """The text of a direct message from the owner, or None for anything else."""
-    sender = {str(envelope.get(k) or "").lower() for k in ("sourceUuid", "sourceNumber")}
-    msg = envelope.get("dataMessage") or {}
-    text = str(msg.get("message") or "").strip()
-    # Groups are refused: a reply there would reach everyone in the group.
-    if owner.lower() not in sender or msg.get("groupInfo") or not text:
-        return None
-    return text
-
-
-def envelope_of(data: str) -> dict:
-    """The envelope in one event's data. Raises on data that isn't JSON."""
-    payload = json.loads(data)
-    payload = payload.get("params", payload)  # tolerate a JSON-RPC notification wrapper
-    return payload.get("envelope") or {}
-
-
-def owner_message(cfg: dict, data: str) -> tuple[str, int | None] | None:
-    """(text, Signal timestamp) of the owner's direct message in one event's data, or None."""
-    envelope = envelope_of(data)
-    text = inbound_text(envelope, cfg["owner"])
-    if text is None:
-        if (envelope.get("dataMessage") or {}).get("message"):
-            log("ignored a message from someone else, or a group")
-        return None
-    return text, envelope.get("timestamp")
-
-
-def parse_sse(lines):
-    """Yield (id, data) for each server-sent event in an iterable of raw lines."""
-    event_id, data = None, []
-    for raw in lines:
-        line = raw.decode("utf-8").rstrip("\r\n")
-        if not line:
-            if data:
-                yield event_id, "\n".join(data)
-            event_id, data = None, []
-            continue
-        field, _, value = line.partition(":")  # a ':' comment line has an empty field
-        value = value[1:] if value.startswith(" ") else value
-        if field == "id":
-            event_id = value
-        elif field == "data":
-            data.append(value)
-
-
-def stream_events(cfg: dict, handle) -> None:
-    """Feed every event's data to `handle`, forever, resuming after the last one handled."""
-    while True:
-        last_id = STATE_FILE.read_text().strip() if STATE_FILE.exists() else ""
-        headers = {"Accept": "text/event-stream", **({"Last-Event-ID": last_id} if last_id else {})}
-        req = urllib.request.Request(cfg["signal_rpc"] + "/api/v1/events", headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                for event_id, data in parse_sse(resp):
-                    handle(data)
-                    if event_id:
-                        STATE_FILE.write_text(event_id)
-        except Exception as exc:  # stream dropped, daemon restarting, read timeout
-            log(f"event stream lost ({exc}); reconnecting in 5s")
-        time.sleep(5)
-
-
-# ── crew: signal-cli events -> KiroCrew inbound webhook ──
-
-
-def sign(secret: str, ts: str, body: bytes) -> str:
-    """KiroCrew webhook signature: HMAC-SHA256 over '{timestamp}.{raw body}'."""
-    return "sha256=" + hmac.new(secret.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
-
-
-def post_hook(cfg: dict, token: str, secret: str, message: str) -> bool:
-    body = json.dumps(
-        {"message": message, "sessionKey": "hook:signal", "name": "Signal", "deliver": False}
-    ).encode()
-    url = cfg["hook_url"]
-    parts = urllib.parse.urlsplit(url)
-    for delay in RETRY_DELAYS:
-        time.sleep(delay)
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-            "Origin": f"{parts.scheme}://{parts.netloc}",
-        }
-        if secret:
-            # Re-signed per attempt: the gateway refuses a signature it has already seen.
-            ts = str(int(time.time()))
-            headers.update({"X-KiroCrew-Timestamp": ts, "X-KiroCrew-Signature": sign(secret, ts, body)})
-        try:
-            urllib.request.urlopen(urllib.request.Request(url, data=body, headers=headers), timeout=30).close()
-            return True
-        except urllib.error.HTTPError as exc:
-            detail = exc.read()[:200].decode("utf-8", "replace")
-            if exc.code not in (409, 429, 503):  # only busy / capacity / switched-off are worth waiting out
-                log(f"webhook refused the message ({exc.code}): {detail}")
-                return False
-            log(f"webhook busy ({exc.code}), retrying")
-        except OSError as exc:
-            log(f"webhook unreachable ({exc}), retrying")
-    return False
-
-
-def crew_event(cfg: dict, token: str, secret: str, data: str) -> None:
-    # Never raises: an event that cannot be handled must not stall the stream on a retry loop.
-    try:
-        got = owner_message(cfg, data)
-        if got is None:
-            return
-        try:
-            rpc(cfg, "sendTyping", {"recipient": [cfg["owner"]]})
-        except Exception:
-            pass  # cosmetic
-        if not post_hook(cfg, token, secret, FRAME_CREW.format(text=got[0])):
-            send_to_owner(cfg, "KiroCrew did not accept that message, so it was dropped. Check the relay log.")
-    except Exception as exc:
-        log(f"could not relay an event: {exc}")
-
-
-def run_crew(cfg: dict) -> None:
-    token = os.environ.get("KIROCREW_WEBHOOK_TOKEN", "")
-    secret = os.environ.get("KIROCREW_WEBHOOK_SIGNING_SECRET", "")
-    if not token:
-        raise SystemExit("KIROCREW_WEBHOOK_TOKEN is not set")
-    log(f"relaying the owner's direct messages to {cfg['hook_url']}")
-    stream_events(cfg, lambda data: crew_event(cfg, token, secret, data))
-
-
-# ── kiro: signal-cli events -> a Kiro IDE chat, through the bridge extension ──
+# ── relay ──
 #
-# Messages are queued in pending.json, so neither a busy chat nor a relay restart loses one, and
-# a thread hands everything queued to the bridge as one prompt once the chat is between turns.
-# The owner sees where a message is from Signal's own marks, never from status messages:
-# delivered = queued, read = in the chat, typing = Kiro's turn is running.
+# The owner follows a message by Signal's own marks: delivered means queued, read means it's in
+# the chat, typing means the turn is running. Words come only when something fails.
 
-_pending_lock = threading.Lock()
+_queue_lock = threading.Lock()
 
 
-def load_pending() -> list[dict]:
-    """Queued messages: {"text", "ts" (Signal timestamp, for the read receipt), "force"}."""
+def load_queue() -> list[dict]:
     try:
-        items = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+        return json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    return [i if isinstance(i, dict) else {"text": i, "ts": None, "force": False} for i in items]
 
 
-def save_pending(items: list[dict]) -> None:
-    PENDING_FILE.write_text(json.dumps(items), encoding="utf-8")
+def save_queue(items: list[dict]) -> None:
+    QUEUE_FILE.write_text(json.dumps(items), encoding="utf-8")
 
 
-def queued(text: str, ts: int | None) -> dict:
-    """A message as queued: the force keyword comes off and sets `force`."""
-    m = FORCE.match(text)
-    return {"text": text[m.end():].strip() if m else text, "ts": ts, "force": bool(m)}
+def queued(text: str, timestamp: int | None) -> dict:
+    force = FORCE.match(text)
+    return {"text": text[force.end():].strip() if force else text, "ts": timestamp, "force": bool(force)}
 
 
-def kiro_event(cfg: dict, data: str) -> None:
-    # Never raises, like crew_event.
+def enqueue(cfg: dict, event_data: str) -> None:
     try:
-        got = owner_message(cfg, data)
-        if got is not None:
-            with _pending_lock:
-                save_pending(load_pending() + [queued(*got)])
-    except Exception as exc:
+        envelope = envelope_of(event_data)
+        text = owners_text(envelope, cfg["owner"])
+        if text is None:
+            if (envelope.get("dataMessage") or {}).get("message"):
+                log("ignored a message from someone else, or a group")
+            return
+        with _queue_lock:
+            save_queue(load_queue() + [queued(text, envelope.get("timestamp"))])
+    except Exception as exc:  # one bad event mustn't stop the stream
         log(f"could not queue an event: {exc}")
 
 
 def bridge(cfg: dict, token: str, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
-    """One bridge request: (status, reply), or (0, {}) when nothing answers."""
+    """(status, reply), or (0, {}) when the Kiro window isn't open."""
     req = urllib.request.Request(
         cfg["kiro_bridge"] + path,
         method=method,
@@ -367,7 +278,7 @@ def bridge(cfg: dict, token: str, method: str, path: str, body: dict | None = No
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:  # a forced prompt waits for the stop
+        with urllib.request.urlopen(req, timeout=90) as resp:  # a forced prompt waits up to 60 s for the stop
             return resp.status, json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
         try:
@@ -378,143 +289,72 @@ def bridge(cfg: dict, token: str, method: str, path: str, body: dict | None = No
         return 0, {}
 
 
-def signal_quietly(cfg: dict, method: str, params: dict) -> None:
-    try:
-        rpc(cfg, method, params)
-    except Exception as exc:  # a missed receipt or typing mark is cosmetic
-        log(f"{method} failed: {exc}")
-
-
-def settle_delivery(cfg: dict, items: list[dict], sent_text: bool, code: int, reply: dict, state: dict) -> None:
-    """After the bridge's answer to `items`: update the queue and tell the owner, by receipt
-    when they went in, in words only when something failed."""
-    with _pending_lock:
-        rest = load_pending()
-        if code == 504:  # couldn't stop the turn: these go in when it ends, without force
-            save_pending([{**i, "force": False} for i in rest[: len(items)]] + rest[len(items):])
-        else:  # in, or refused: done either way; keep what arrived meanwhile
-            save_pending(rest[len(items):])
-    if code == 202:
-        stamps = [i["ts"] for i in items if i.get("ts")]
-        if stamps:
-            signal_quietly(cfg, "sendReceipt", {"recipient": cfg["owner"], "targetTimestamp": stamps, "type": "read"})
-        state["typing"], state["typed_at"] = sent_text, 0.0
-    elif code == 504:
-        send_to_owner(cfg, "Kiro didn't stop the running turn, so your message goes in when it ends.")
-    else:
-        log(f"bridge refused the message ({code}): {reply}")
-        send_to_owner(cfg, f"The Kiro bridge refused that message ({code}: {reply.get('error')}), so it was dropped.")
-
-
-def deliver_to_kiro(cfg: dict, token: str, state: dict) -> None:
-    """One tick: hand everything queued to the chat if it will take it, and keep the typing
-    indicator in step with the turn. `state` carries "typing" and "typed_at" between ticks."""
-    with _pending_lock:
-        items = load_pending()
+def deliver(cfg: dict, token: str, state: dict) -> None:
+    """Hands everything queued to the chat as one prompt, when it will take it, and keeps the
+    typing indicator in step with the turn."""
+    with _queue_lock:
+        items = load_queue()
     if items:
         texts = [i["text"] for i in items if i["text"]]
-        force = any(i.get("force") for i in items)
-        code, reply = 202, {}  # a keyword alone, with nothing queued, has nothing to put in
+        code, reply = 202, {}  # "flush" alone has nothing to put in, and is done
         if texts:
-            body = {"session": cfg["kiro_session"], "text": FRAME_KIRO.format(text="\n\n".join(texts)), "force": force}
+            body = {"session": cfg["kiro_session"], "text": PROMPT.format(text="\n\n".join(texts)), "force": any(i["force"] for i in items)}
             code, reply = bridge(cfg, token, "POST", "/prompt", body)
-        # 409 busy or 0 Kiro closed: they stay queued, shown as delivered but not read.
-        if code not in (409, 0):
-            settle_delivery(cfg, items, bool(texts), code, reply, state)
+        if code not in (409, 0):  # busy, or Kiro closed: they wait
+            with _queue_lock:
+                rest = load_queue()[len(items):]
+                if code == 504:  # the turn didn't stop: they go in when it ends
+                    rest = [{**i, "force": False} for i in items] + rest
+                save_queue(rest)
+            if code == 202:
+                stamps = [i["ts"] for i in items if i.get("ts")]
+                if stamps:
+                    rpc_or_log(cfg, "sendReceipt", {"recipient": cfg["owner"], "targetTimestamp": stamps, "type": "read"})
+                state.update(typing=bool(texts), typed_at=0.0)
+            elif code == 504:
+                send_to_owner(cfg, "Kiro didn't stop the running turn, so your message goes in when it ends.")
+            else:
+                log(f"bridge refused the message ({code}): {reply}")
+                send_to_owner(cfg, f"The Kiro bridge refused that message ({code}: {reply.get('error')}), so it was dropped.")
 
     if state.get("typing"):
-        code, st = bridge(cfg, token, "GET", f"/status?session={cfg['kiro_session']}")
-        if code == 200 and st.get("busy"):
-            if time.monotonic() - state["typed_at"] >= TYPING_EVERY:
-                signal_quietly(cfg, "sendTyping", {"recipient": [cfg["owner"]]})
+        code, status = bridge(cfg, token, "GET", f"/status?session={cfg['kiro_session']}")
+        if code == 200 and status.get("busy"):
+            if time.monotonic() - state["typed_at"] >= TYPING_REFRESH_SECONDS:
+                rpc_or_log(cfg, "sendTyping", {"recipient": [cfg["owner"]]})
                 state["typed_at"] = time.monotonic()
-        else:  # the turn ended, or Kiro went away
-            signal_quietly(cfg, "sendTyping", {"recipient": [cfg["owner"]], "stop": True})
+        else:
+            rpc_or_log(cfg, "sendTyping", {"recipient": [cfg["owner"]], "stop": True})
             state["typing"] = False
 
 
-def run_kiro(cfg: dict) -> None:
-    for key in ("kiro_bridge", "kiro_session"):
-        if not cfg.get(key):
-            raise SystemExit(f"{CONFIG_FILE}: no '{key}' yet. Run: install.py chat")
-    if not TOKEN_FILE.exists():
-        raise SystemExit(f"{TOKEN_FILE} is missing: open the Kiro window so the bridge writes it")
-    token = TOKEN_FILE.read_text(encoding="utf-8").strip()
+def run_relay(cfg: dict) -> None:
+    if not cfg.get("kiro_session"):
+        raise SystemExit(f"{CONFIG_FILE} has no chat yet: run install.py chat")
+    if not BRIDGE_TOKEN_FILE.exists():
+        raise SystemExit(f"{BRIDGE_TOKEN_FILE} is missing: run install.py bridge, and keep that Kiro window open")
+    token = BRIDGE_TOKEN_FILE.read_text(encoding="utf-8").strip()
 
-    def deliver_forever():
-        state: dict = {"typing": False, "typed_at": 0.0}
+    def deliver_every_5_seconds():
+        state = {"typing": False, "typed_at": 0.0}
         while True:
             try:
-                deliver_to_kiro(cfg, token, state)
+                deliver(cfg, token, state)
             except Exception as exc:
                 log(f"delivery failed: {exc}")
             time.sleep(5)
 
-    threading.Thread(target=deliver_forever, daemon=True).start()
-    log(f"relaying the owner's direct messages to Kiro chat {cfg['kiro_session']}")
-    stream_events(cfg, lambda data: kiro_event(cfg, data))
-
-
-# ── wait: the owner's next message, for an agent that polls instead of being pushed to ──
-
-
-def wait_events(cfg: dict, timeout: float, pick, settle: float = 3.0) -> list:
-    """Whatever `pick(envelope)` returns (not None) from the next delivery, or [] once `timeout`
-    seconds pass. After each pick it keeps reading for `settle` seconds, so a burst comes back
-    together.
-    ponytail: in on-connection mode the daemon acks a message to Signal before handing it over,
-    so one delivered in the instant this closes the stream is lost. The relays have no such gap.
-    """
-    url = urllib.parse.urlsplit(cfg["signal_rpc"])
-    conn = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=10)
-    deadline, got = time.monotonic() + timeout, []
-
-    def lines():
-        while (left := deadline - time.monotonic()) > 0:
-            conn.sock.settimeout(left)
-            try:
-                line = resp.readline()
-            except OSError:  # read timeout, or the daemon went away
-                return
-            if not line:
-                return
-            yield line
-
-    try:
-        conn.request("GET", "/api/v1/events", headers={"Accept": "text/event-stream"})
-        resp = conn.getresponse()
-        if resp.status != 200:
-            raise RuntimeError(f"signal-cli events: HTTP {resp.status}")
-        for _, data in parse_sse(lines()):
-            try:
-                hit = pick(envelope_of(data))
-            except ValueError:
-                continue
-            if hit is not None:
-                got.append(hit)
-                deadline = time.monotonic() + settle
-    finally:
-        conn.close()
-    return got
-
-
-def wait_owner(cfg: dict, timeout: float, settle: float = 3.0) -> list[str]:
-    return wait_events(cfg, timeout, lambda env: inbound_text(env, cfg["owner"]), settle)
+    threading.Thread(target=deliver_every_5_seconds, daemon=True).start()
+    log(f"relaying the owner's messages to Kiro chat {cfg['kiro_session']}")
+    follow_events(cfg, lambda data: enqueue(cfg, data))
 
 
 def main() -> None:
+    modes = {"relay": run_relay, "mcp": serve_mcp}
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode not in ("mcp", "kiro", "crew", "wait"):
-        raise SystemExit("usage: kiro_signal.py mcp|kiro|crew|wait [seconds]")
-    cfg = load_config()
-    if mode == "wait":
-        secs = float(sys.argv[2]) if len(sys.argv) > 2 else 600
-        got = wait_owner(cfg, secs)
-        # UTF-8 bytes: the Windows console code page would mangle emoji and accents.
-        out = "\n\n".join(f"[Signal from the owner] {t}" for t in got) or f"No Signal message in {secs:g} s."
-        sys.stdout.buffer.write(out.encode() + b"\n")
-        return
-    {"mcp": serve_mcp, "kiro": run_kiro, "crew": run_crew}[mode](cfg)
+    if mode not in modes:
+        raise SystemExit("usage: kiro_signal.py relay|mcp")
+    modes[mode](load_config())
 
 
 if __name__ == "__main__":

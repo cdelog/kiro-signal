@@ -1,12 +1,94 @@
-# kiro-signal
+<a id="readme-top"></a>
 
-Text your Kiro chat from your phone, over Signal, and get its answers back there.
+<!-- Structure adapted from othneildrew/Best-README-Template, credited in Acknowledgments. -->
 
-You message a Signal contact called Kiro. The message lands in the Kiro chat you picked, as if you'd typed it. The agent answers with a `signal_reply` tool, so its answer comes to your phone. Signal's own marks show where your message is: delivered means it's queued, read means it's in the chat, and typing means the agent is working.
+[![Python][python-shield]][python-url]
+[![Kiro][kiro-shield]][kiro-url]
+[![Platforms][platform-shield]](#prerequisites)
+[![License][license-shield]][license-url]
 
-> **AI agents:** to install this for a user, follow [INSTALL.md](INSTALL.md) step by step.
+<br />
+<div align="center">
+  <h3 align="center">kiro-signal</h3>
 
-## Install: ask your AI
+  <p align="center">
+    Text your Kiro chat from your phone, over Signal, and get its answers back there.
+    <br />
+    <a href="INSTALL.md"><strong>The install runbook</strong></a>
+    <br />
+    <br />
+    <a href="https://github.com/cdelog/kiro-signal/issues/new?labels=bug">Report a bug</a>
+    &middot;
+    <a href="https://github.com/cdelog/kiro-signal/issues/new?labels=enhancement">Request a feature</a>
+  </p>
+</div>
+
+<details>
+  <summary>Table of contents</summary>
+  <ol>
+    <li><a href="#about-the-project">About the project</a>
+      <ul>
+        <li><a href="#status">Status</a></li>
+        <li><a href="#built-with">Built with</a></li>
+      </ul>
+    </li>
+    <li><a href="#getting-started">Getting started</a>
+      <ul>
+        <li><a href="#prerequisites">Prerequisites</a></li>
+        <li><a href="#installation">Installation</a></li>
+      </ul>
+    </li>
+    <li><a href="#usage">Usage</a></li>
+    <li><a href="#repository-layout">Repository layout</a></li>
+    <li><a href="#security">Security</a></li>
+    <li><a href="#limits">Limits</a></li>
+    <li><a href="#contributing">Contributing</a></li>
+    <li><a href="#license">License</a></li>
+    <li><a href="#acknowledgments">Acknowledgments</a></li>
+  </ol>
+</details>
+
+## About the project
+
+You message a Signal contact called Kiro. The message lands in the Kiro chat you picked, as if you'd typed it, and the agent answers with a `signal_reply` tool, so the answer comes to your phone.
+
+I built it to keep working with Kiro away from my desk. Signal does the status for free: delivered means your message is queued, read means it's in the chat, and typing means the agent is on it.
+
+```
+your phone --Signal--> signal-cli daemon, on 127.0.0.1
+                         |-- events --> kiro_signal.py relay --> bridge extension --> your Kiro chat
+                         '-- send   <-- kiro_signal.py mcp   <-- signal_reply    <-- the agent
+```
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+### Status
+
+- [x] The relay and the bridge. Their logic has carried my own messages every day since 20 October 2026, and this repository is a cleaned-up copy.
+- [x] The installer on Windows 11 and Kiro 1.4.10, up to registration: the signal-cli download and checksum, finding Java, picking the chat, installing the extension.
+- [ ] A fresh registration through the installer, from a new number.
+- [ ] macOS.
+- [ ] Linux.
+
+If you're the first to try one of the unchecked lines, an issue saying how it went is a big help.
+
+### Built with
+
+- Python's standard library and nothing else. Python 3.9 or newer.
+- A Kiro extension with no dependencies, packed by the installer, so there's no Node or vsce step.
+- [signal-cli](https://github.com/AsamK/signal-cli), downloaded from its own releases at install time.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Getting started
+
+### Prerequisites
+
+- Kiro, on Windows, macOS or Linux.
+- Python 3.9 or newer, and Java 25 or newer for signal-cli. The agent installs either one if it's missing, and you accept the system prompt.
+- **A phone number for the bot that isn't your own.** Registering a number signs out whatever Signal install uses it. A cheap prepaid SIM works, or any number that can take an SMS or a voice call.
+
+### Installation
 
 Open Kiro in the project you want to reach from your phone, start a chat, and paste:
 
@@ -14,98 +96,95 @@ Open Kiro in the project you want to reach from your phone, start a chat, and pa
 Clone https://github.com/cdelog/kiro-signal to ~/kiro-signal and install it by following its INSTALL.md. Connect it to this chat.
 ```
 
-The agent does the setup and checks each step. It stops four times, for things only you can do:
+The agent runs the setup and checks each step. It stops four times for things only you can do:
 
-1. **Give it a phone number for the bot.** Not your own: registering a number signs out whatever Signal install uses it. A cheap prepaid SIM works, or any number that can take a voice call.
-2. **Solve a captcha** in your browser and paste back the link it gives you.
-3. **Read out the code** Signal sends to that number.
-4. **Send the bot one text** from your phone, with a word the agent gives you, so it knows the messages are yours.
+1. Tell it the bot's phone number.
+2. Solve a captcha in your browser, and paste back the link it gives you.
+3. Read out the code Signal sends to that number.
+4. Text the bot one word from your phone, so it knows which account is yours.
 
-It takes about 15 minutes, mostly downloads and waiting for the code.
+It takes about 15 minutes, most of it the signal-cli download and waiting for the code.
 
-**Needs:** Kiro on Windows, macOS or Linux, Python 3.9 or newer, and Java 25 or newer (the agent installs Java if it's missing; Linux on x86_64 doesn't need it).
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-## Using it
+## Usage
 
-- **Send anything.** If the agent is in the middle of a turn, your message waits and goes in when the turn ends. Several waiting messages go in together.
+- **Send anything.** If the agent is mid-turn, your message waits for the turn to end. Messages that wait go in together.
 - **`force`** or **`flush`** on its own, or `force: <text>`, stops the running turn and puts everything in now. "Force push the branch" is an ordinary message.
-- **Turn on Read receipts and Typing indicators** on your phone (Signal, Settings, Privacy) to see the marks. Words come only when something fails.
-- **Your computer must be on, with that Kiro window open.** A message sent while Kiro is closed waits, and goes in when the window opens.
+- **Turn on Read receipts and Typing indicators** in Signal, under Settings, Privacy, to see the marks. You only get words when something fails.
+- **Keep the computer on and that Kiro window open.** A message sent while Kiro is closed waits, and goes in when the window opens.
 
-## How it works
+`python install.py doctor` shows what's set up and running, and the next command to run. `python install.py -h` lists every command.
 
-```
-your phone --Signal--> signal-cli daemon (127.0.0.1)
-                         |-- events --> kiro_signal.py kiro --> bridge extension --> your Kiro chat
-                         '-- send   <-- kiro_signal.py mcp  <-- signal_reply  <----- the agent
-```
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-- **[signal-cli](https://github.com/AsamK/signal-cli)**, a third-party Signal client, runs as a local daemon and holds the bot's account.
-- **`kiro_signal.py`** is the relay and the MCP server: about 450 lines of standard-library Python.
-- **`bridge/`** is a Kiro extension, about 270 lines with no dependencies. It hands each message to the chat, and tells the relay when the chat is busy.
-- **`install.py`** sets it all up. Every step is one command that never prompts, so an agent can run it.
+## Repository layout
+
+| Path             | What it is                                                                                               |
+| ---------------- | -------------------------------------------------------------------------------------------------------- |
+| `kiro_signal.py` | The relay, which queues your messages and hands them to the chat, and the MCP server with `signal_reply` |
+| `bridge/`        | The Kiro extension that types a message into the chat, and says when the chat is busy                    |
+| `install.py`     | The installer. Every step is one command that never prompts, so an agent can run it                      |
+| `INSTALL.md`     | The runbook the agent follows, including what to ask you and when                                        |
+| `tests/`         | Self-checks for both Python files. No network, signal-cli or Kiro                                        |
+
+Everything kiro-signal writes lives in `~/.kiro-signal`, except for one entry in Kiro's `mcp.json`, the extension, and the autostart entry. Set `KIRO_SIGNAL_HOME` to put it somewhere else.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Security
 
-Read this before installing.
+Read this before you install.
 
-- **A Signal message becomes a prompt on your computer.** If the agent runs with tools approved automatically, a message can do whatever the agent can.
-- **Only you get through.** The relay accepts direct messages from one Signal account, yours, checked by its account ID, which Signal authenticates. Messages from anyone else, and group messages, are dropped.
-- **Anyone with one of your Signal devices can drive your agent.** Check Signal, Settings, Linked devices, and turn on Registration Lock for your own account.
-- **Text the agent reads is the bigger risk.** Web pages, issues and emails can carry instructions. That's true without kiro-signal, but you aren't watching when you're away, so keep auto-approval to tools you'd trust unattended.
-- **Replies only reach you.** `signal_reply` sends to your account whatever arguments it's given.
-- **Everything listens on 127.0.0.1 only.** The signal-cli daemon's HTTP API has no authentication, so any program on your computer can send as the bot. The bridge needs a random token and refuses other Host headers, so a web page can't reach it.
-- **`~/.kiro-signal/signal-data` holds the bot's identity keys.** Anything that can read it can impersonate the bot.
-- **signal-cli is checked before it's installed:** the download must match the SHA-256 that GitHub publishes for the release.
+- **A Signal message becomes a prompt on your computer.** If the agent runs with tools approved automatically, a message can do anything the agent can.
+- **Only your account gets through.** The relay accepts direct messages from one Signal account, checked by the account ID that Signal authenticates. It drops messages from anyone else, and group messages.
+- **Anyone holding one of your Signal devices can drive your agent.** Check Signal's Linked devices, and turn on Registration Lock for your own account.
+- **Text the agent reads is the bigger risk.** Web pages, issues and emails can carry instructions. That's true without kiro-signal too, but you aren't watching when you're away, so only auto-approve tools you'd trust unattended.
+- **Replies reach only you.** `signal_reply` sends to your account whatever arguments it gets.
+- **Everything listens on 127.0.0.1.** The signal-cli daemon's HTTP API has no authentication, so any program on your computer can send as the bot. The bridge needs a random token and refuses other Host headers, so a web page can't reach it.
+- **`~/.kiro-signal/signal-data` holds the bot's identity keys.** Anything that can read it can pose as the bot.
+- **The installer checks signal-cli before installing it.** The download must match the SHA-256 GitHub publishes for the release.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Limits
 
-- **Unofficial.** Signal has no bot API, and signal-cli isn't Signal's. A bot number can hit rate limits or captchas. signal-cli releases older than about three months stop working: `install.py doctor` warns you, and `install.py signal-cli` updates.
-- **The bridge relies on Kiro internals that aren't documented:** `kiroAgent.sessions.sendPrompt`, Kiro's session records, and the agent server's cancel message. It was checked on Kiro 1.4.10. A Kiro update can break it; your messages stay queued until it's fixed.
-- **One chat at a time.** Text only: no attachments, reactions or groups.
-- **Updating the bridge needs a window reload,** which ends a running turn.
+- **It's unofficial.** Signal has no bot API, and signal-cli isn't Signal's. A bot number can hit rate limits or captchas, and signal-cli releases stop working after about three months. `install.py doctor` warns you, and `install.py signal-cli` updates it.
+- **The bridge relies on three Kiro internals with no documentation**, listed at the top of `bridge/extension.js`. A Kiro update can break it. Your messages stay queued until it's fixed.
+- **One chat, and text only.** No attachments, reactions or groups.
+- **Updating the extension takes a window reload**, which ends a running turn.
 
-## Other ways to use it
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-- **Any MCP client:** `kiro_signal.py mcp` is a plain stdio MCP server with one tool, `signal_reply`.
-- **[KiroCrew](https://github.com/kirodotdev/KiroCrew):** `install.py crew` relays to KiroCrew's inbound webhook instead of a Kiro chat. See INSTALL.md.
-- **Polling:** `kiro_signal.py wait [seconds]` prints your next message and exits, for an agent that checks Signal itself. Start the daemon alone with `install.py start --no-relay`.
+## Contributing
 
-## Commands
-
-| Command | What it does |
-| --- | --- |
-| `install.py doctor` | What's set up, what's running, and the next command |
-| `install.py signal-cli` | Download or update signal-cli, and find Java |
-| `install.py register --number +1...` | Register the bot's number (`--captcha`, `--voice`) |
-| `install.py verify --code 123456` | Finish registering, set a registration lock PIN and the name "Kiro" |
-| `install.py owner --phrase WORD` | Pair with the phone that texts WORD to the bot |
-| `install.py chat` | Pick the Kiro chat your messages go to (`--session` to name one) |
-| `install.py mcp` | Add `signal_reply` to `~/.kiro/settings/mcp.json` |
-| `install.py bridge` | Build and install the Kiro extension |
-| `install.py start` / `stop` | Start or stop the daemon and the relay |
-| `install.py autostart` | Start at login (`--off` to undo) |
-| `install.py uninstall` | Stop, and remove the autostart entry, the MCP server and the extension |
-
-Everything kiro-signal writes lives in `~/.kiro-signal`, apart from one entry in Kiro's `mcp.json`, the extension, and the autostart entry. Set `KIRO_SIGNAL_HOME` to move it.
-
-## Uninstall
-
-```
-python ~/kiro-signal/install.py uninstall
-```
-
-Then delete `~/kiro-signal` and `~/.kiro-signal`.
-
-## Tests
+Issues and pull requests are welcome. Keep it to the standard library and one extension with no dependencies, and run both self-checks before you open a PR:
 
 ```
 python tests/test_kiro_signal.py
 python tests/test_install.py
 ```
 
-They stub out signal-cli, Kiro and the network, and never touch your real settings.
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## License
 
-MIT. signal-cli is GPL-3.0; it's downloaded from its own releases at install time, not bundled. Not affiliated with Signal, Kiro or AWS.
+MIT. See [`LICENSE`](LICENSE). signal-cli is GPL-3.0. The installer downloads it from its own releases, and this repository doesn't include it. kiro-signal isn't affiliated with Signal, Kiro or AWS.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Acknowledgments
+
+- [signal-cli](https://github.com/AsamK/signal-cli) by AsamK, which does the hard part.
+- [Best-README-Template](https://github.com/othneildrew/Best-README-Template) by othneildrew, for this README's structure.
+- [Shields.io](https://shields.io) for the badges.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+[python-shield]: https://img.shields.io/badge/python-3.9+-3776AB?style=for-the-badge&logo=python&logoColor=white
+[python-url]: https://docs.python.org/3/library/
+[kiro-shield]: https://img.shields.io/badge/kiro-1.4-7B61FF?style=for-the-badge
+[kiro-url]: https://kiro.dev
+[platform-shield]: https://img.shields.io/badge/platforms-windows_|_macos_|_linux-lightgrey?style=for-the-badge
+[license-shield]: https://img.shields.io/badge/license-MIT-green?style=for-the-badge
+[license-url]: LICENSE
