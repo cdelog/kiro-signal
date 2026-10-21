@@ -1,0 +1,20 @@
+{
+  "name": "kiro-signal-bridge",
+  "displayName": "Kiro Signal Bridge",
+  "description": "Lets the local kiro-signal relay type the owner's Signal messages into a Kiro chat.",
+  "publisher": "kiro-signal",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cdelog/kiro-signal"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ]
+}

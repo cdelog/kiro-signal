@@ -1,0 +1,10 @@
+# Everything personal lives in ~/.kiro-signal, outside the repo. These guard against a copy
+# landing here by mistake.
+config.json
+bridge_token.txt
+pending.json
+last_event_id.txt
+registration-lock-pin.txt
+*.vsix
+*.log
+__pycache__/
