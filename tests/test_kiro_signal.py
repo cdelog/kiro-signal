@@ -118,8 +118,9 @@ assert ks.wait_for_event(daemon, 1, pairing) is None
 assert 0.9 < time.monotonic() - start < 3
 server.shutdown()
 
-# ── the relay. The owner follows a message by Signal's marks: no notice while busy or closed, a
-# read receipt once it's in the chat, typing while the turn runs, words only on a failure. ──
+# ── the relay. The owner follows the chat by Signal's marks: no notice while busy or closed, a
+# read receipt once a message is in the chat, typing whenever the chat is mid-turn, words only on
+# a failure. ──
 signal.clear()
 answers, requests = [], []  # the bridge's answers to hand out, and the requests it got
 
@@ -159,40 +160,50 @@ ks.enqueue(cfg, "not json")
 assert [(i["text"], i["ts"]) for i in ks.load_queue()] == [("first", 101), ("second", 103)]
 assert signal == []
 
-# Busy, then Kiro closed: they wait, silently.
+IDLE, BUSY = (200, {"busy": False}), (200, {"busy": True})
 state = {"typing": False, "typed_at": 0.0}
-answers[:] = [(409, {}), (0, {})]
-tick(state)
-tick(state)
-assert signal == [] and len(ks.load_queue()) == 2
 
-# In: one prompt, both marked read, then typing while the turn runs, stopped when it ends.
-answers[:] = [(202, {}), (200, {"busy": True})]
+# A turn started at the desk shows typing too, and the queued messages wait for it, unread.
+answers[:] = [(409, {}), BUSY]
+tick(state)
+assert calls("sendTyping") == [{"recipient": [OWNER]}] and calls("sendReceipt") == [] and len(ks.load_queue()) == 2
+
+# Kiro closes: they still wait, and typing stops.
+answers[:] = [(0, {}), (0, {})]
+tick(state)
+assert calls("sendTyping")[-1] == {"recipient": [OWNER], "stop": True} and not state["typing"] and len(ks.load_queue()) == 2
+
+# In: one prompt, both marked read, typing while the turn runs, refreshed every 10 s, stopped when it ends.
+signal.clear()
+answers[:] = [(202, {}), BUSY]
 tick(state)
 method, path, body = requests[-2]
 assert (method, path, body["force"]) == ("POST", "/prompt", False)
 assert body["text"].startswith("[") and "first\n\nsecond" in body["text"]
 assert calls("sendReceipt") == [{"recipient": OWNER, "targetTimestamp": [101, 103], "type": "read"}]
 assert calls("sendTyping") == [{"recipient": [OWNER]}] and ks.load_queue() == []
-answers[:] = [(200, {"busy": True})]
+answers[:] = [BUSY]
 tick(state)
 assert len(calls("sendTyping")) == 1
 state["typed_at"] -= ks.TYPING_REFRESH_SECONDS
-answers[:] = [(200, {"busy": True})]
+answers[:] = [BUSY]
 tick(state)
 assert len(calls("sendTyping")) == 2
-answers[:] = [(200, {"busy": False})]
+answers[:] = [IDLE]
 tick(state)
 assert calls("sendTyping")[-1] == {"recipient": [OWNER], "stop": True} and not state["typing"]
+answers[:] = [IDLE]
+tick(state)
+assert len(calls("sendTyping")) == 3  # no second stop
 assert calls("send") == []
 
 # A message mid-turn waits; "flush" puts it in, forced, and both are marked read.
 signal.clear()
 ks.enqueue(cfg, event("look at the failing test", 201))
-answers[:] = [(409, {})]
+answers[:] = [(409, {}), BUSY]
 tick(state)
 ks.enqueue(cfg, event("flush", 202))
-answers[:] = [(202, {}), (200, {"busy": True})]
+answers[:] = [(202, {}), BUSY]
 tick(state)
 body = requests[-2][2]
 assert body["force"] is True and "look at the failing test" in body["text"] and "flush" not in body["text"]
@@ -200,7 +211,7 @@ assert calls("sendReceipt")[-1]["targetTimestamp"] == [201, 202]
 
 # A turn that won't stop: one notice, and the message waits for the turn, no longer forced.
 ks.save_queue([ks.queued("force: now", 301)])
-answers[:] = [(504, {}), (200, {"busy": False})]
+answers[:] = [(504, {}), BUSY]
 signal.clear()
 tick(state)
 assert ks.load_queue() == [{"text": "now", "ts": 301, "force": False}]
@@ -210,12 +221,14 @@ assert len(calls("send")) == 1 and "didn't stop" in calls("send")[0]["message"]
 ks.save_queue([ks.queued("flush", 401)])
 requests.clear()
 signal.clear()
+answers[:] = [IDLE]
 tick(state)
-assert requests == [] and ks.load_queue() == [] and calls("sendReceipt")[0]["targetTimestamp"] == [401]
+assert [p for _, p, _ in requests] == ["/status?session=sess_x"] and ks.load_queue() == []
+assert calls("sendReceipt")[0]["targetTimestamp"] == [401]
 
 # Refused: dropped, and said in words.
 ks.save_queue([ks.queued("hello", 501)])
-answers[:] = [(400, {"error": "text is empty or starts with /"})]
+answers[:] = [(400, {"error": "text is empty or starts with /"}), IDLE]
 signal.clear()
 tick(state)
 assert ks.load_queue() == [] and "refused" in calls("send")[0]["message"]

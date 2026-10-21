@@ -52,7 +52,7 @@
 
 You message a Signal contact called Kiro. The message lands in the Kiro chat you picked, as if you'd typed it, and the agent answers with a `signal_reply` tool, so the answer comes to your phone.
 
-I built it to keep working with Kiro away from my desk. Signal does the status for free: delivered means your message is queued, read means it's in the chat, and typing means the agent is on it.
+I built it to keep working with Kiro away from my desk. Signal does the status for free: delivered means your message is queued, read means it's in the chat, and typing means the chat is mid-turn, whoever started the turn.
 
 ```
 your phone --Signal--> signal-cli daemon, on 127.0.0.1

@@ -233,8 +233,8 @@ def serve_mcp(cfg: dict) -> None:
 
 # ── relay ──
 #
-# The owner follows a message by Signal's own marks: delivered means queued, read means it's in
-# the chat, typing means the turn is running. Words come only when something fails.
+# The owner follows the chat by Signal's own marks: delivered means queued, read means it's in
+# the chat, typing means the chat is mid-turn. Words come only when something fails.
 
 _queue_lock = threading.Lock()
 
@@ -290,8 +290,8 @@ def bridge(cfg: dict, token: str, method: str, path: str, body: dict | None = No
 
 
 def deliver(cfg: dict, token: str, state: dict) -> None:
-    """Hands everything queued to the chat as one prompt, when it will take it, and keeps the
-    typing indicator in step with the turn."""
+    """Hands everything queued to the chat as one prompt, when it will take it, and shows the
+    typing indicator whenever the chat is mid-turn, whoever started the turn."""
     with _queue_lock:
         items = load_queue()
     if items:
@@ -310,22 +310,20 @@ def deliver(cfg: dict, token: str, state: dict) -> None:
                 stamps = [i["ts"] for i in items if i.get("ts")]
                 if stamps:
                     rpc_or_log(cfg, "sendReceipt", {"recipient": cfg["owner"], "targetTimestamp": stamps, "type": "read"})
-                state.update(typing=bool(texts), typed_at=0.0)
             elif code == 504:
                 send_to_owner(cfg, "Kiro didn't stop the running turn, so your message goes in when it ends.")
             else:
                 log(f"bridge refused the message ({code}): {reply}")
                 send_to_owner(cfg, f"The Kiro bridge refused that message ({code}: {reply.get('error')}), so it was dropped.")
 
-    if state.get("typing"):
-        code, status = bridge(cfg, token, "GET", f"/status?session={cfg['kiro_session']}")
-        if code == 200 and status.get("busy"):
-            if time.monotonic() - state["typed_at"] >= TYPING_REFRESH_SECONDS:
-                rpc_or_log(cfg, "sendTyping", {"recipient": [cfg["owner"]]})
-                state["typed_at"] = time.monotonic()
-        else:
-            rpc_or_log(cfg, "sendTyping", {"recipient": [cfg["owner"]], "stop": True})
-            state["typing"] = False
+    code, status = bridge(cfg, token, "GET", f"/status?session={cfg['kiro_session']}")
+    if code == 200 and status.get("busy"):
+        if not state["typing"] or time.monotonic() - state["typed_at"] >= TYPING_REFRESH_SECONDS:
+            rpc_or_log(cfg, "sendTyping", {"recipient": [cfg["owner"]]})
+            state.update(typing=True, typed_at=time.monotonic())
+    elif state["typing"]:
+        rpc_or_log(cfg, "sendTyping", {"recipient": [cfg["owner"]], "stop": True})
+        state["typing"] = False
 
 
 def run_relay(cfg: dict) -> None:

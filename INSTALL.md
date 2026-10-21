@@ -113,7 +113,7 @@ PY KS/install.py doctor
 Tell the user, in this chat:
 
 - It's ready. Whatever they text the bot comes into this chat when your turn ends.
-- They should turn on Read receipts and Typing indicators in Signal, under Settings, Privacy, to see when a message is queued, read, and being worked on.
+- They should turn on Read receipts and Typing indicators in Signal, under Settings, Privacy. Then delivered means queued, read means it's in the chat, and typing means the chat is mid-turn, whoever started it.
 - `force` or `flush` stops a running turn and puts their message in now.
 - The computer and this Kiro window need to stay open.
 
