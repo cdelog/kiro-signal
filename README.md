@@ -38,7 +38,11 @@
         <li><a href="#installation">Installation</a></li>
       </ul>
     </li>
-    <li><a href="#usage">Usage</a></li>
+    <li><a href="#usage">Usage</a>
+      <ul>
+        <li><a href="#interrupting-a-turn-with-force">Interrupting a turn with force</a></li>
+      </ul>
+    </li>
     <li><a href="#repository-layout">Repository layout</a></li>
     <li><a href="#security">Security</a></li>
     <li><a href="#limits">Limits</a></li>
@@ -52,7 +56,7 @@
 
 You message a Signal contact called Kiro. The message lands in the Kiro chat you picked, as if you'd typed it, and the agent answers with a `signal_reply` tool, so the answer comes to your phone.
 
-I built it to keep working with Kiro away from my desk. Signal does the status for free: delivered means your message is queued, read means it's in the chat, and typing means the chat is mid-turn, whoever started the turn.
+I built it to keep working with Kiro away from my desk. Signal does the status for free: delivered means your message is queued, read means it's in the chat, and typing means the chat is mid-turn, whoever started the turn. A message waits for the running turn to end, unless you start it with [`force:`](#interrupting-a-turn-with-force).
 
 ```
 your phone --Signal--> signal-cli daemon, on 127.0.0.1
@@ -109,12 +113,25 @@ It takes about 15 minutes, most of it the signal-cli download and waiting for th
 
 ## Usage
 
+> [!TIP]
+> **Need the agent now?** Start your message with `force:`. It stops the running turn and puts your message in straight away.
+
 - **Send anything.** If the agent is mid-turn, your message waits for the turn to end. Messages that wait go in together.
-- **`force`** or **`flush`** on its own, or `force: <text>`, stops the running turn and puts everything in now. "Force push the branch" is an ordinary message.
 - **Turn on Read receipts and Typing indicators** in Signal, under Settings, Privacy, to see the marks. You only get words when something fails.
 - **Keep the computer on and that Kiro window open.** A message sent while Kiro is closed waits, and goes in when the window opens.
 
 `python install.py doctor` shows what's set up and running, and the next command to run. `python install.py -h` lists every command.
+
+### Interrupting a turn with force
+
+| You send                              | What happens                                                          |
+| ------------------------------------- | --------------------------------------------------------------------- |
+| `force: stop and look at the CI logs` | Stops the running turn, then puts in everything queued, and this text |
+| `force`                               | Stops the running turn, then puts in everything queued                |
+| `flush`                               | The same as `force`                                                   |
+| `Force push the branch`               | An ordinary message                                                   |
+
+Capitals don't matter, but the keyword counts only on its own, or followed by `:` or a new line. It stops the turn the way the chat's Stop button does. If the turn hasn't stopped after 60 seconds, your messages wait for it to end, and you get one message saying so.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
