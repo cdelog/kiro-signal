@@ -115,6 +115,7 @@ Tell the user, in this chat:
 - It's ready. Whatever they text the bot comes into this chat when your turn ends.
 - They should turn on Read receipts and Typing indicators in Signal, under Settings, Privacy. Then delivered means queued, read means it's in the chat, and typing means the chat is mid-turn, whoever started it.
 - **A message waits for the running turn to end, unless it starts with `force:`.** That stops the turn and puts their message in now, for example `force: stop and look at the CI logs`. `force` or `flush` alone does the same with whatever is queued.
+- Photos work both ways: theirs arrive in this chat as images, and you can send them screenshots with `signal_reply`'s `attachments`.
 - The computer and this Kiro window need to stay open.
 
 Then end your turn. Their first message arrives as this chat's next prompt. Answer it with `signal_reply`, which proves the loop both ways.

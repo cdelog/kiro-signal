@@ -8,7 +8,8 @@
 // 1.4.10, which an update can break:
 //   - the command kiroAgent.sessions.sendPrompt, which resolves when the turn ends;
 //   - each chat's session.json, whose status is "in_progress" while a turn runs;
-//   - the session/cancel message that the chat's Stop button sends to the window's agent server.
+//   - the window's agent server, which takes session/cancel, as the chat's Stop button sends it,
+//     and session/prompt with image blocks, as the chat sends a picture you drag in.
 
 const vscode = require('vscode');
 const crypto = require('crypto');
@@ -22,7 +23,8 @@ const HOME =
 const KIRO_SESSIONS = path.join(os.homedir(), '.kiro', 'sessions');
 const TOKEN_FILE = path.join(HOME, 'bridge_token.txt');
 const SESSION_ID = /^sess_[0-9a-f-]{36}$/;
-const MAX_BODY_BYTES = 64 * 1024;
+const MAX_BODY_BYTES = 20 * 1024 * 1024; // a prompt can carry photos, base64
+const IMAGE_TYPES = /^image\/(png|jpeg|gif|webp)$/;
 const KIRO_BUSY = /already in-flight/i;
 const turnsWeStarted = new Map(); // session id to the promise of its turn
 
@@ -68,21 +70,19 @@ function readBody(req) {
   });
 }
 
-// Kiro refuses a prompt within a moment or not at all, so a prompt that hasn't failed after 3 s
-// is in. Returns the refusal, or null.
-async function sendPrompt(id, text, log) {
-  const turn = Promise.resolve(
-    vscode.commands.executeCommand('kiroAgent.sessions.sendPrompt', id, text),
-  );
+// Kiro refuses a prompt within a moment or not at all, so a turn that hasn't failed after 3 s is
+// in. Returns the refusal, or null.
+function track(id, turn, log, onEnd = () => {}) {
   turnsWeStarted.set(id, turn);
   turn
     .then(
       () => log.info(`turn ended in ${id}`),
       (err) => log.warn(`turn in ${id} failed: ${err?.message ?? err}`),
     )
-    .finally(
-      () => turnsWeStarted.get(id) === turn && turnsWeStarted.delete(id),
-    );
+    .finally(() => {
+      onEnd();
+      if (turnsWeStarted.get(id) === turn) turnsWeStarted.delete(id);
+    });
   return Promise.race([
     turn.then(
       () => null,
@@ -92,7 +92,8 @@ async function sendPrompt(id, text, log) {
   ]);
 }
 
-async function stopTurn(workspace, id) {
+// A JSON-RPC connection to this window's agent server, beside the chat's own.
+async function agentServer(workspace, log) {
   const servers =
     (await vscode.commands.executeCommand(
       'kiro.agentRegistry.getAgentEndpoints',
@@ -104,62 +105,123 @@ async function stopTurn(workspace, id) {
   const ws = new WebSocket(
     `ws://127.0.0.1:${server.port}?token=${encodeURIComponent(server.token)}`,
   );
-  try {
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error("the agent server didn't answer")),
-        10000,
-      );
-      ws.onerror = () => reject(new Error("can't reach the agent server"));
-      ws.onopen = () =>
+  const waiting = new Map();
+  let nextId = 1;
+  ws.onmessage = (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if ('method' in msg) {
+      if (msg.id !== undefined) {
+        // A question meant for the chat's own connection; this one can't answer it.
+        log.info(`the agent server asked the bridge: ${msg.method}`);
         ws.send(
           JSON.stringify({
             jsonrpc: '2.0',
-            id: 1,
-            method: 'initialize',
-            params: {
-              protocolVersion: 1,
-              clientCapabilities: {},
-              clientInfo: { name: 'kiro-signal-bridge', version: '1.0.0' },
-            },
+            id: msg.id,
+            error: { code: -32601, message: 'not handled by the bridge' },
           }),
         );
-      ws.onmessage = (event) => {
-        let msg;
-        try {
-          msg = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        if (msg.id !== 1 || 'method' in msg) return;
-        clearTimeout(timer);
-        msg.error ? reject(new Error(msg.error.message)) : resolve();
-      };
-    });
-    ws.send(
-      JSON.stringify({
-        jsonrpc: '2.0',
-        method: 'session/cancel',
-        params: { sessionId: id },
-      }),
+      }
+      return;
+    }
+    const call = waiting.get(msg.id);
+    if (!call) return;
+    waiting.delete(msg.id);
+    msg.error
+      ? call.reject(new Error(msg.error.message))
+      : call.resolve(msg.result);
+  };
+  ws.onclose = () => {
+    for (const call of waiting.values())
+      call.reject(new Error('the agent server closed the connection'));
+    waiting.clear();
+  };
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("the agent server didn't answer")),
+      10000,
     );
+    ws.onopen = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    ws.onerror = () => reject(new Error("can't reach the agent server"));
+  });
+  const request = (method, params) =>
+    new Promise((resolve, reject) => {
+      const id = nextId++;
+      waiting.set(id, { resolve, reject });
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+    });
+  await request('initialize', {
+    protocolVersion: 1,
+    clientCapabilities: {},
+    clientInfo: { name: 'kiro-signal-bridge', version: '1.1.0' },
+  });
+  return {
+    request,
+    notify: (method, params) =>
+      ws.send(JSON.stringify({ jsonrpc: '2.0', method, params })),
+    close: () => ws.close(),
+  };
+}
+
+function sendPrompt(id, text, log) {
+  return track(
+    id,
+    Promise.resolve(
+      vscode.commands.executeCommand('kiroAgent.sessions.sendPrompt', id, text),
+    ),
+    log,
+  );
+}
+
+// sendPrompt takes text only, so a prompt with photos goes to the agent server directly.
+async function sendPromptWithImages(workspace, id, text, images, log) {
+  const server = await agentServer(workspace, log);
+  const blocks = [
+    { type: 'text', text },
+    ...images.map((i) => ({
+      type: 'image',
+      data: i.data,
+      mimeType: i.mimeType,
+    })),
+  ];
+  return track(
+    id,
+    server.request('session/prompt', { sessionId: id, prompt: blocks }),
+    log,
+    server.close,
+  );
+}
+
+async function stopTurn(workspace, id, log) {
+  const server = await agentServer(workspace, log);
+  try {
+    server.notify('session/cancel', { sessionId: id });
     await sleep(300); // let the frame go out before the socket closes
   } finally {
-    ws.close();
+    server.close();
   }
 }
 
 // [status, body]: 202 in, 409 busy, 504 the forced stop didn't take within 60 s.
-async function prompt(cfg, id, text, force, log) {
+async function prompt(cfg, id, text, images, force, log) {
   if (busy(id)) {
     if (!force) return [409, { error: 'session is mid-turn' }];
-    await stopTurn(cfg.kiro_workspace, id);
+    await stopTurn(cfg.kiro_workspace, id, log);
     log.info(`stopped the running turn in ${id}`);
   }
   const deadline = Date.now() + (force ? 60000 : 0); // a stopped turn takes a moment to wind down
   for (;;) {
     if (!busy(id)) {
-      const refusal = await sendPrompt(id, text, log);
+      const refusal = images.length
+        ? await sendPromptWithImages(cfg.kiro_workspace, id, text, images, log)
+        : await sendPrompt(id, text, log);
       if (!refusal) return [202, { session: id, accepted: true }];
       if (!KIRO_BUSY.test(String(refusal?.message ?? refusal)))
         return [502, { error: String(refusal?.message ?? refusal) }];
@@ -241,16 +303,28 @@ function activate(context) {
         const text = String(body.text ?? '').trim();
         if (!text || text.startsWith('/'))
           return reply(400, { error: 'text is empty or starts with /' });
+        const images = Array.isArray(body.images) ? body.images : [];
+        if (
+          !images.every(
+            (i) =>
+              IMAGE_TYPES.test(String(i?.mimeType)) &&
+              typeof i?.data === 'string',
+          )
+        )
+          return reply(400, {
+            error: 'images must be {mimeType: image/png|jpeg|gif|webp, data: base64}',
+          });
         const [code, result] = await prompt(
           cfg,
           id,
           text,
+          images,
           body.force === true,
           log,
         );
         if (code === 202)
           log.info(
-            `prompt sent to ${id} (${text.length} chars${body.force ? ', forced' : ''})`,
+            `prompt sent to ${id} (${text.length} chars, ${images.length} photo(s)${body.force ? ', forced' : ''})`,
           );
         return reply(code, result);
       }

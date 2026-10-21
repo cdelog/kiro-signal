@@ -56,7 +56,11 @@
 
 You message a Signal contact called Kiro. The message lands in the Kiro chat you picked, as if you'd typed it, and the agent answers with a `signal_reply` tool, so the answer comes to your phone.
 
-I built it to keep working with Kiro away from my desk. Signal does the status for free: delivered means your message is queued, read means it's in the chat, and typing means the chat is mid-turn, whoever started the turn. A message waits for the running turn to end, unless you start it with [`force:`](#interrupting-a-turn-with-force).
+<p align="center">
+  <img src="docs/signal-chat.jpg" width="320" alt="A Signal chat with Kiro on a phone. Kiro sends a screenshot of this repository's GitHub page and asks for a go-ahead, the reply says 'I can see it. Go for it.', and Kiro's typing bubble shows below.">
+</p>
+
+I built it to keep working with Kiro away from my desk. Signal does the status for free: delivered means your message is queued, read means it's in the chat, and typing means the chat is mid-turn, whoever started the turn. A message waits for the running turn to end, unless you start it with [`force:`](#interrupting-a-turn-with-force). Photos go both ways: one you send lands in the chat as an image, and the agent can send you a screenshot.
 
 ```
 your phone --Signal--> signal-cli daemon, on 127.0.0.1
@@ -70,6 +74,7 @@ your phone --Signal--> signal-cli daemon, on 127.0.0.1
 
 - [x] The relay and the bridge. Their logic has carried my own messages every day since 20 October 2026, and this repository is a cleaned-up copy.
 - [x] The installer on Windows 11 and Kiro 1.4.10, up to registration: the signal-cli download and checksum, finding Java, picking the chat, installing the extension.
+- [x] Photos both ways, on Windows: one sent from a phone arrived in the chat as an image, and a screenshot of a web page came back.
 - [ ] A fresh registration through the installer, from a new number.
 - [ ] macOS.
 - [ ] Linux.
@@ -117,6 +122,7 @@ It takes about 15 minutes, most of it the signal-cli download and waiting for th
 > **Need the agent now?** Start your message with `force:`. It stops the running turn and puts your message in straight away.
 
 - **Send anything.** If the agent is mid-turn, your message waits for the turn to end. Messages that wait go in together.
+- **Send photos and files.** A photo goes in as an image, as if you'd dragged it into the chat. Any other file arrives as a path the agent can open. The agent can send you files too, such as a screenshot.
 - **Turn on Read receipts and Typing indicators** in Signal, under Settings, Privacy, to see the marks. You only get words when something fails.
 - **Keep the computer on and that Kiro window open.** A message sent while Kiro is closed waits, and goes in when the window opens.
 
@@ -157,7 +163,7 @@ Read this before you install.
 - **Only your account gets through.** The relay accepts direct messages from one Signal account, checked by the account ID that Signal authenticates. It drops messages from anyone else, and group messages.
 - **Anyone holding one of your Signal devices can drive your agent.** Check Signal's Linked devices, and turn on Registration Lock for your own account.
 - **Text the agent reads is the bigger risk.** Web pages, issues and emails can carry instructions. That's true without kiro-signal too, but you aren't watching when you're away, so only auto-approve tools you'd trust unattended.
-- **Replies reach only you.** `signal_reply` sends to your account whatever arguments it gets.
+- **Replies reach only you.** `signal_reply` sends to your account whatever arguments it gets. It can attach any file the agent names, so a prompt that tricks the agent could send you one of your own files, and no one else.
 - **Everything listens on 127.0.0.1.** The signal-cli daemon's HTTP API has no authentication, so any program on your computer can send as the bot. The bridge needs a random token and refuses other Host headers, so a web page can't reach it.
 - **`~/.kiro-signal/signal-data` holds the bot's identity keys.** Anything that can read it can pose as the bot.
 - **The installer checks signal-cli before installing it.** The download must match the SHA-256 GitHub publishes for the release.
@@ -168,7 +174,7 @@ Read this before you install.
 
 - **It's unofficial.** Signal has no bot API, and signal-cli isn't Signal's. A bot number can hit rate limits or captchas, and signal-cli releases stop working after about three months. `install.py doctor` warns you, and `install.py signal-cli` updates it.
 - **The bridge relies on three Kiro internals with no documentation**, listed at the top of `bridge/extension.js`. A Kiro update can break it. Your messages stay queued until it's fixed.
-- **One chat, and text only.** No attachments, reactions or groups.
+- **One chat.** No reactions or groups, and the agent can't listen to a voice note: it arrives as a file.
 - **Updating the extension takes a window reload**, which ends a running turn.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>

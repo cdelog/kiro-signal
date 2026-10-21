@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
@@ -18,13 +19,19 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HOME = Path(os.environ.get("KIRO_SIGNAL_HOME") or Path.home() / ".kiro-signal")
 CONFIG_FILE = HOME / "config.json"
 STREAM_POSITION_FILE = HOME / "last_event_id.txt"
 QUEUE_FILE = HOME / "pending.json"
 BRIDGE_TOKEN_FILE = HOME / "bridge_token.txt"
+SIGNAL_DATA = HOME / "signal-data"
+ATTACHMENTS = SIGNAL_DATA / "attachments"
 DEFAULTS = {"signal_rpc": "http://127.0.0.1:39275", "kiro_bridge": "http://127.0.0.1:39276"}
+
+# The image types a Kiro chat takes inline, as when you drag a picture in.
+INLINE_IMAGE = re.compile(r"^image/(png|jpeg|gif|webp)$")
+INLINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024
 
 # Signal's apps turn a longer message into a text attachment.
 SIGNAL_MESSAGE_LIMIT = 2000
@@ -43,14 +50,23 @@ TOOL = {
     "name": "signal_reply",
     "description": (
         "Send a Signal message to the owner, the only recipient this tool can reach. "
-        "Plain text; long text is split into several messages."
+        "Plain text; long text is split into several messages. Files, such as a screenshot, "
+        "go with the first message."
     ),
     "inputSchema": {
         "type": "object",
-        "properties": {"text": {"type": "string", "description": "The message to send"}},
+        "properties": {
+            "text": {"type": "string", "description": "The message to send"},
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Absolute paths of files to send with it, such as a screenshot",
+            },
+        },
         "required": ["text"],
     },
 }
+SIGNAL_ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024
 
 
 def log(msg: str) -> None:
@@ -98,19 +114,45 @@ def split_message(text: str, limit: int = SIGNAL_MESSAGE_LIMIT) -> list[str]:
     return out + [text] if text else out
 
 
-def send_to_owner(cfg: dict, text: str) -> int:
+def send_to_owner(cfg: dict, text: str, attachments: list[str] = ()) -> int:
     parts = split_message(text)
-    for part in parts:
-        rpc(cfg, "send", {"recipient": [cfg["owner"]], "message": part})
+    for n, part in enumerate(parts):
+        params = {"recipient": [cfg["owner"]], "message": part}
+        if n == 0 and attachments:
+            params["attachments"] = list(attachments)
+        rpc(cfg, "send", params)
     return len(parts)
 
 
+def sendable(paths) -> list[str]:
+    """The paths as absolute file paths, or ValueError naming the first that can't be sent."""
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        raise ValueError("attachments must be a list of file paths")
+    files = [Path(p).expanduser().resolve() for p in paths]
+    for given, f in zip(paths, files):
+        if not f.is_file():
+            raise ValueError(f"no file at {given}")
+        if f.stat().st_size > SIGNAL_ATTACHMENT_MAX_BYTES:
+            raise ValueError(f"{given} is over Signal's 100 MB limit")
+    return [str(f) for f in files]
+
+
 def owners_text(envelope: dict, owner: str) -> str | None:
-    """The text of a direct message from `owner`. Groups are refused: a reply would reach everyone."""
+    """The text of a direct message from `owner`, "" for files alone, or None for anything else.
+    Groups are refused: a reply would reach everyone."""
     senders = {str(envelope.get(k) or "").lower() for k in ("sourceUuid", "sourceNumber")}
     msg = envelope.get("dataMessage") or {}
     text = str(msg.get("message") or "").strip()
-    return text if owner.lower() in senders and not msg.get("groupInfo") and text else None
+    return text if owner.lower() in senders and not msg.get("groupInfo") and (text or msg.get("attachments")) else None
+
+
+def attachments_of(envelope: dict) -> list[dict]:
+    """The files on a message, where signal-cli saved them: {"path", "type", "name", "size"}."""
+    return [
+        {"path": str(ATTACHMENTS / Path(a["id"]).name), "type": a.get("contentType") or "", "name": a.get("filename") or a["id"], "size": a.get("size") or 0}
+        for a in (envelope.get("dataMessage") or {}).get("attachments") or []
+        if a.get("id")
+    ]
 
 
 def envelope_of(event_data: str) -> dict:
@@ -205,12 +247,16 @@ def mcp_reply(cfg: dict, req: dict) -> dict | None:
     elif method == "tools/list":
         result = {"tools": [TOOL]}
     elif method == "tools/call" and params.get("name") == TOOL["name"]:
-        # Only `text` is read, so no argument can change the recipient.
-        text = str((params.get("arguments") or {}).get("text") or "").strip()
+        # Only `text` and `attachments` are read, so no argument can change the recipient.
+        arguments = params.get("arguments") or {}
+        text = str(arguments.get("text") or "").strip()
         try:
             if not text:
                 raise ValueError("text is empty")
-            result = {"content": [{"type": "text", "text": f"Sent {send_to_owner(cfg, text)} Signal message(s) to the owner."}]}
+            files = sendable(arguments.get("attachments") or [])
+            sent = send_to_owner(cfg, text, files)
+            with_files = f" with {len(files)} file(s)" if files else ""
+            result = {"content": [{"type": "text", "text": f"Sent {sent} Signal message(s){with_files} to the owner."}]}
         except Exception as exc:
             result = {"content": [{"type": "text", "text": f"Signal send failed: {exc}"}], "isError": True}
     else:
@@ -250,9 +296,26 @@ def save_queue(items: list[dict]) -> None:
     QUEUE_FILE.write_text(json.dumps(items), encoding="utf-8")
 
 
-def queued(text: str, timestamp: int | None) -> dict:
+def queued(text: str, timestamp: int | None, files: list[dict] = ()) -> dict:
     force = FORCE.match(text)
-    return {"text": text[force.end():].strip() if force else text, "ts": timestamp, "force": bool(force)}
+    return {"text": text[force.end():].strip() if force else text, "ts": timestamp, "force": bool(force), "files": list(files)}
+
+
+def prompt_parts(items: list[dict]) -> tuple[list[str], list[dict]]:
+    """Each queued message's text with a line per file, and the photos that go in as images. A
+    photo goes in as an image, like one dragged into the chat; any other file goes in as its path."""
+    parts, images = [], []
+    for item in items:
+        lines = [item["text"]] if item["text"] else []
+        for f in item.get("files") or []:
+            if INLINE_IMAGE.match(f["type"]) and f["size"] <= INLINE_IMAGE_MAX_BYTES and Path(f["path"]).is_file():
+                images.append({"mimeType": f["type"], "data": base64.b64encode(Path(f["path"]).read_bytes()).decode()})
+                lines.append(f"[Photo attached as an image, also saved at {f['path']}]")
+            else:
+                lines.append(f"[Attachment: {f['name']}, {f['type'] or 'unknown type'}, {f['size'] // 1024} KB, saved at {f['path']}]")
+        if lines:
+            parts.append("\n".join(lines))
+    return parts, images
 
 
 def enqueue(cfg: dict, event_data: str) -> None:
@@ -264,7 +327,7 @@ def enqueue(cfg: dict, event_data: str) -> None:
                 log("ignored a message from someone else, or a group")
             return
         with _queue_lock:
-            save_queue(load_queue() + [queued(text, envelope.get("timestamp"))])
+            save_queue(load_queue() + [queued(text, envelope.get("timestamp"), attachments_of(envelope))])
     except Exception as exc:  # one bad event mustn't stop the stream
         log(f"could not queue an event: {exc}")
 
@@ -295,10 +358,12 @@ def deliver(cfg: dict, token: str, state: dict) -> None:
     with _queue_lock:
         items = load_queue()
     if items:
-        texts = [i["text"] for i in items if i["text"]]
+        texts, images = prompt_parts(items)
         code, reply = 202, {}  # "flush" alone has nothing to put in, and is done
         if texts:
             body = {"session": cfg["kiro_session"], "text": PROMPT.format(text="\n\n".join(texts)), "force": any(i["force"] for i in items)}
+            if images:
+                body["images"] = images
             code, reply = bridge(cfg, token, "POST", "/prompt", body)
         if code not in (409, 0):  # busy, or Kiro closed: they wait
             with _queue_lock:

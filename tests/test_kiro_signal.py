@@ -1,5 +1,6 @@
 """Run: python tests/test_kiro_signal.py. signal-cli and the bridge are stubbed out."""
 
+import base64
 import json
 import os
 import sys
@@ -71,6 +72,17 @@ assert not call({"text": "hello", "recipient": "+19999999999"})["result"].get("i
 assert signal == [("send", {"recipient": [OWNER], "message": "hello"})]
 assert call({"text": "  "})["result"]["isError"]
 assert ks.mcp_reply(cfg, {"jsonrpc": "2.0", "id": 5, "method": "resources/list"})["error"]["code"] == -32601
+
+# Files go with the first message, as absolute paths; one that can't be sent stops the send.
+shot = Path(tempfile.mkdtemp()) / "shot.png"
+shot.write_bytes(b"\x89PNG")
+signal.clear()
+reply = call({"text": "here it is", "attachments": [str(shot)]})["result"]
+assert not reply.get("isError") and "1 file" in reply["content"][0]["text"]
+assert signal == [("send", {"recipient": [OWNER], "message": "here it is", "attachments": [str(shot.resolve())]})]
+signal.clear()
+assert call({"text": "x", "attachments": [str(shot.with_name("nope.png"))]})["result"]["isError"]
+assert call({"text": "x", "attachments": "not a list"})["result"]["isError"] and signal == []
 
 
 class Events(BaseHTTPRequestHandler):
@@ -214,7 +226,7 @@ ks.save_queue([ks.queued("force: now", 301)])
 answers[:] = [(504, {}), BUSY]
 signal.clear()
 tick(state)
-assert ks.load_queue() == [{"text": "now", "ts": 301, "force": False}]
+assert ks.load_queue() == [{"text": "now", "ts": 301, "force": False, "files": []}]
 assert len(calls("send")) == 1 and "didn't stop" in calls("send")[0]["message"]
 
 # "flush" with nothing queued puts nothing in, and is marked read.
@@ -232,5 +244,38 @@ answers[:] = [(400, {"error": "text is empty or starts with /"}), IDLE]
 signal.clear()
 tick(state)
 assert ks.load_queue() == [] and "refused" in calls("send")[0]["message"]
+
+# Files from the owner: a photo goes in as an image with its path, any other file as its path. A
+# photo with no text counts; a stranger's doesn't.
+ks.ATTACHMENTS = Path(tempfile.mkdtemp())
+(ks.ATTACHMENTS / "p1.jpg").write_bytes(b"\xff\xd8jpeg")
+(ks.ATTACHMENTS / "d1.pdf").write_bytes(b"%PDF")
+
+
+def with_files(text, ts, attachments, sender=OWNER):
+    return json.dumps({"envelope": {"sourceUuid": sender, "timestamp": ts, "dataMessage": {"message": text, "timestamp": ts, "attachments": attachments}}})
+
+
+photo = {"id": "p1.jpg", "contentType": "image/jpeg", "size": 6}
+pdf = {"id": "d1.pdf", "contentType": "application/pdf", "filename": "plan.pdf", "size": 4096}
+assert ks.owners_text(json.loads(with_files(None, 1, [photo]))["envelope"], OWNER) == ""
+ks.enqueue(cfg, with_files(None, 601, [photo]))
+ks.enqueue(cfg, with_files("and the plan", 602, [pdf]))
+ks.enqueue(cfg, with_files(None, 603, [photo], sender=STRANGER))
+assert [i["ts"] for i in ks.load_queue()] == [601, 602]
+answers[:] = [(202, {}), IDLE]
+signal.clear()
+tick(state)
+body = requests[-2][2]
+assert body["images"] == [{"mimeType": "image/jpeg", "data": base64.b64encode(b"\xff\xd8jpeg").decode()}]
+assert f"Photo attached as an image, also saved at {ks.ATTACHMENTS / 'p1.jpg'}" in body["text"]
+assert "and the plan" in body["text"] and f"plan.pdf, application/pdf, 4 KB, saved at {ks.ATTACHMENTS / 'd1.pdf'}" in body["text"]
+assert calls("sendReceipt")[-1]["targetTimestamp"] == [601, 602] and ks.load_queue() == []
+
+# Text alone carries no images key.
+ks.save_queue([ks.queued("plain", 701)])
+answers[:] = [(202, {}), IDLE]
+tick(state)
+assert "images" not in requests[-2][2]
 
 print("kiro_signal: ok")
